@@ -112,7 +112,6 @@ void kernel_main(void)
 	}
 
 	while (1){
-		printf("here!\n");
 		schedule();
 	}	
 }
