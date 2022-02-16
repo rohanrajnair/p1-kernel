@@ -16,6 +16,44 @@
 #define CHAR_DELAY (1000000)
 #endif
 
+void sleep(int x) {
+	current->state = TASK_WAITING; // setting state to WAIT
+	// prevent timer interrupt from happening before WAIT is set
+	disable_irq(); 
+	gen_timer_init(); // enable timer
+	gen_timer_reset(x << 26); // interrupt will fire in x seconds
+	enable_irq();
+}
+
+void process_sleep(char *array)
+{
+#ifdef USE_LFB // (optional) determine the init locations on the graphical console
+	int scr_x, scr_y; 
+	char c; 
+	if (array[0] == '1') {
+		scr_x = 0; scr_y = 320; 
+	} else {
+		scr_x = 0; scr_y = 480; 
+	}
+#endif 
+
+	while (1){
+		for (int i = 0; i < 5; i++){
+			uart_send(array[i]);
+#ifdef USE_LFB  // (optional) output to the graphical console
+			c = array[i+1]; array[i+1]='\0';
+			lfb_print_update(&scr_x, &scr_y, array+i);
+			array[i+1] = c; 
+			if (scr_x > 1024)
+				lfb_print_update(&scr_x, &scr_y, "\n");
+#endif
+			delay(CHAR_DELAY);
+		}
+		sleep(5); // sleep for 3 seconds
+		schedule(); // yield
+	}
+}
+
 void process(char *array)
 {
 #ifdef USE_LFB // (optional) determine the init locations on the graphical console
@@ -49,6 +87,10 @@ void kernel_main(void)
 	uart_init();
 	init_printf(0, putc);
 
+	irq_vector_init();
+	enable_interrupt_controller();
+	enable_irq();
+
 	printf("kernel boots\r\n");	
 
 #ifdef USE_LFB // (optional) init output to the graphical console
@@ -57,7 +99,7 @@ void kernel_main(void)
 	lfb_print(0, 240, "kernel boots");
 #endif		
 
-	int res = copy_process((unsigned long)&process, (unsigned long)"12345");
+	int res = copy_process((unsigned long)&process_sleep, (unsigned long)"12345");
 	if (res != 0) {
 		printf("error while starting process 1");
 		return;
@@ -70,6 +112,7 @@ void kernel_main(void)
 	}
 
 	while (1){
+		printf("here!\n");
 		schedule();
 	}	
 }

@@ -2,6 +2,7 @@
 #include "printf.h"
 #include "peripherals/timer.h"
 #include "timer.h"
+#include "sched.h"
 
 #ifdef USE_QEMU
 unsigned int interval = (1 << 26); // xzl: around 1 sec
@@ -27,15 +28,22 @@ void generic_timer_init ( void )
 //	interval = read_cntfrq();
 //  printf("System count freq (CNTFRQ) is: %u\n", interval);
 
-	printf("interval is set to: %u\n", interval);
+	//printf("interval is set to: %u\n", interval);
 	gen_timer_init();
 	gen_timer_reset(interval);
 }
 
 void handle_generic_timer_irq( void ) 
 {
-	printf("Timer interrupt received. next in %u ticks\n\r", interval);
-	gen_timer_reset(interval);
+	gen_timer_disable(); // disable timer by writing to CNTP_CTL register
+	struct task_struct * p; // iterate through tasks
+	//printf("\ninside interrupt handler!\n");
+	for (int i = 0; i < NR_TASKS; i++){
+			p = task[i];
+			if (p->state == TASK_WAITING) {
+				p->state = TASK_RUNNING; // set state to READY
+			}
+		}
 }
 
 

@@ -18,3 +18,9 @@ gen_timer_reset:
 #	lsl x0, x0, #24
 	msr CNTP_TVAL_EL0, x0
     ret
+
+.globl gen_timer_disable
+gen_timer_disable:
+	mov x0, #0
+	msr CNTP_CTL_EL0, x0
+	ret
