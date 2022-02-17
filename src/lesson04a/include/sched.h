@@ -19,6 +19,7 @@
 extern struct task_struct *current;
 extern struct task_struct * task[NR_TASKS];
 extern int nr_tasks;
+extern int num_proc_waiting;
 
 struct cpu_context {
 	unsigned long x19;

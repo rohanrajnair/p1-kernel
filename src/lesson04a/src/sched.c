@@ -6,14 +6,16 @@ static struct task_struct init_task = INIT_TASK;
 struct task_struct *current = &(init_task);
 struct task_struct * task[NR_TASKS] = {&(init_task), };
 int nr_tasks = 1;
+int num_proc_waiting = 0;
 
 void _schedule(void)
 {
-	int next, c;
+	int next, c, num_waiting;
 	struct task_struct * p;
 	while (1) {
 		c = -1;	// the maximum counter found so far
 		next = 0;
+		num_waiting = 0; // number of tasks waiting
 
 		/* Iterates over all tasks and tries to find a task in 
 		TASK_RUNNING state with the maximum counter. If such 
@@ -22,6 +24,9 @@ void _schedule(void)
 
 		for (int i = 0; i < NR_TASKS; i++){
 			p = task[i];
+			if (p && p->state == TASK_WAITING) {
+				num_waiting += 1;
+			}
 			if (p && p->state == TASK_RUNNING && p->counter > c) {
 				c = p->counter;
 				next = i;
@@ -29,6 +34,9 @@ void _schedule(void)
 		}
 		if (c) {
 			break;
+		}
+		if (num_waiting == nr_tasks - 1) {
+			num_proc_waiting = num_waiting; 
 		}
 
 		/* If no such task is found, this is either because i) no 

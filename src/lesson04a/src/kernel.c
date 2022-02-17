@@ -103,8 +103,8 @@ void kernel_main(void)
 	if (res != 0) {
 		printf("error while starting process 1");
 		return;
-	}
-	
+	}	
+
 	res = copy_process((unsigned long)&process, (unsigned long)"abcde");
 	if (res != 0) {
 		printf("error while starting process 2");
@@ -112,6 +112,10 @@ void kernel_main(void)
 	}
 
 	while (1){
+		if (num_proc_waiting == nr_tasks - 1) {
+			printf("going to wfi\n");
+			asm("wfi");
+		}
 		schedule();
 	}	
 }
