@@ -1,0 +1,218 @@
+diff --git a/src/lesson04a/include/sched.h b/src/lesson04a/include/sched.h
+index 7c61b11..1568633 100644
+--- a/src/lesson04a/include/sched.h
++++ b/src/lesson04a/include/sched.h
+@@ -13,10 +13,13 @@
+ #define LAST_TASK task[NR_TASKS-1]
+ 
+ #define TASK_RUNNING				0
++#define TASK_WAITING				1
++#define TASK_READY					2
+ 
+ extern struct task_struct *current;
+ extern struct task_struct * task[NR_TASKS];
+ extern int nr_tasks;
++extern int num_proc_waiting;
+ 
+ struct cpu_context {
+ 	unsigned long x19;
+diff --git a/src/lesson04a/src/kernel.c b/src/lesson04a/src/kernel.c
+index 910effe..56c9cda 100644
+--- a/src/lesson04a/src/kernel.c
++++ b/src/lesson04a/src/kernel.c
+@@ -16,6 +16,44 @@
+ #define CHAR_DELAY (1000000)
+ #endif
+ 
++void sleep(int x) {
++	current->state = TASK_WAITING; // setting state to WAIT
++	// prevent timer interrupt from happening before WAIT is set
++	disable_irq(); 
++	gen_timer_init(); // enable timer
++	gen_timer_reset(x << 26); // interrupt will fire in x seconds
++	enable_irq();
++}
++
++void process_sleep(char *array)
++{
++#ifdef USE_LFB // (optional) determine the init locations on the graphical console
++	int scr_x, scr_y; 
++	char c; 
++	if (array[0] == '1') {
++		scr_x = 0; scr_y = 320; 
++	} else {
++		scr_x = 0; scr_y = 480; 
++	}
++#endif 
++
++	while (1){
++		for (int i = 0; i < 5; i++){
++			uart_send(array[i]);
++#ifdef USE_LFB  // (optional) output to the graphical console
++			c = array[i+1]; array[i+1]='\0';
++			lfb_print_update(&scr_x, &scr_y, array+i);
++			array[i+1] = c; 
++			if (scr_x > 1024)
++				lfb_print_update(&scr_x, &scr_y, "\n");
++#endif
++			delay(CHAR_DELAY);
++		}
++		sleep(5); // sleep for 3 seconds
++		schedule(); // yield
++	}
++}
++
+ void process(char *array)
+ {
+ #ifdef USE_LFB // (optional) determine the init locations on the graphical console
+@@ -49,6 +87,10 @@ void kernel_main(void)
+ 	uart_init();
+ 	init_printf(0, putc);
+ 
++	irq_vector_init();
++	enable_interrupt_controller();
++	enable_irq();
++
+ 	printf("kernel boots\r\n");	
+ 
+ #ifdef USE_LFB // (optional) init output to the graphical console
+@@ -57,12 +99,12 @@ void kernel_main(void)
+ 	lfb_print(0, 240, "kernel boots");
+ #endif		
+ 
+-	int res = copy_process((unsigned long)&process, (unsigned long)"12345");
++	int res = copy_process((unsigned long)&process_sleep, (unsigned long)"12345");
+ 	if (res != 0) {
+ 		printf("error while starting process 1");
+ 		return;
+-	}
+-	
++	}	
++
+ 	res = copy_process((unsigned long)&process, (unsigned long)"abcde");
+ 	if (res != 0) {
+ 		printf("error while starting process 2");
+@@ -70,6 +112,10 @@ void kernel_main(void)
+ 	}
+ 
+ 	while (1){
++		if (num_proc_waiting == nr_tasks - 1) {
++			printf("going to wfi\n");
++			asm("wfi");
++		}
+ 		schedule();
+ 	}	
+ }
+diff --git a/src/lesson04a/src/sched.c b/src/lesson04a/src/sched.c
+index 1ea9911..9e99f18 100644
+--- a/src/lesson04a/src/sched.c
++++ b/src/lesson04a/src/sched.c
+@@ -6,14 +6,16 @@ static struct task_struct init_task = INIT_TASK;
+ struct task_struct *current = &(init_task);
+ struct task_struct * task[NR_TASKS] = {&(init_task), };
+ int nr_tasks = 1;
++int num_proc_waiting = 0;
+ 
+ void _schedule(void)
+ {
+-	int next, c;
++	int next, c, num_waiting;
+ 	struct task_struct * p;
+ 	while (1) {
+ 		c = -1;	// the maximum counter found so far
+ 		next = 0;
++		num_waiting = 0; // number of tasks waiting
+ 
+ 		/* Iterates over all tasks and tries to find a task in 
+ 		TASK_RUNNING state with the maximum counter. If such 
+@@ -22,6 +24,9 @@ void _schedule(void)
+ 
+ 		for (int i = 0; i < NR_TASKS; i++){
+ 			p = task[i];
++			if (p && p->state == TASK_WAITING) {
++				num_waiting += 1;
++			}
+ 			if (p && p->state == TASK_RUNNING && p->counter > c) {
+ 				c = p->counter;
+ 				next = i;
+@@ -30,6 +35,9 @@ void _schedule(void)
+ 		if (c) {
+ 			break;
+ 		}
++		if (num_waiting == nr_tasks - 1) {
++			num_proc_waiting = num_waiting; 
++		}
+ 
+ 		/* If no such task is found, this is either because i) no 
+ 		task is in TASK_RUNNING state or ii) all such tasks have 0 counters.
+diff --git a/src/lesson04a/src/timer.S b/src/lesson04a/src/timer.S
+index aade5f5..857a211 100644
+--- a/src/lesson04a/src/timer.S
++++ b/src/lesson04a/src/timer.S
+@@ -18,3 +18,9 @@ gen_timer_reset:
+ #	lsl x0, x0, #24
+ 	msr CNTP_TVAL_EL0, x0
+     ret
++
++.globl gen_timer_disable
++gen_timer_disable:
++	mov x0, #0
++	msr CNTP_CTL_EL0, x0
++	ret
+\ No newline at end of file
+diff --git a/src/lesson04a/src/timer.c b/src/lesson04a/src/timer.c
+index 708d3be..7d09a2d 100644
+--- a/src/lesson04a/src/timer.c
++++ b/src/lesson04a/src/timer.c
+@@ -2,6 +2,7 @@
+ #include "printf.h"
+ #include "peripherals/timer.h"
+ #include "timer.h"
++#include "sched.h"
+ 
+ #ifdef USE_QEMU
+ unsigned int interval = (1 << 26); // xzl: around 1 sec
+@@ -27,15 +28,22 @@ void generic_timer_init ( void )
+ //	interval = read_cntfrq();
+ //  printf("System count freq (CNTFRQ) is: %u\n", interval);
+ 
+-	printf("interval is set to: %u\n", interval);
++	//printf("interval is set to: %u\n", interval);
+ 	gen_timer_init();
+ 	gen_timer_reset(interval);
+ }
+ 
+ void handle_generic_timer_irq( void ) 
+ {
+-	printf("Timer interrupt received. next in %u ticks\n\r", interval);
+-	gen_timer_reset(interval);
++	gen_timer_disable(); // disable timer by writing to CNTP_CTL register
++	struct task_struct * p; // iterate through tasks
++	//printf("\ninside interrupt handler!\n");
++	for (int i = 0; i < NR_TASKS; i++){
++			p = task[i];
++			if (p->state == TASK_WAITING) {
++				p->state = TASK_RUNNING; // set state to READY
++			}
++		}
+ }
+ 
+ 
+diff --git a/src/lesson04a/test.log b/src/lesson04a/test.log
+index 8347e60..ade1ece 100644
+--- a/src/lesson04a/test.log
++++ b/src/lesson04a/test.log
+@@ -1 +1,13 @@
+ Exception return from AArch64 EL2 to AArch64 EL1 PC 0x80038
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x835e4
++...to EL1 PC 0x82a80 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x835e4
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x835e4
++...to EL1 PC 0x82a80 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x835e4
