@@ -5,10 +5,12 @@
 #include "timer.h"
 
 #ifdef USE_QEMU
-unsigned int interval = (1 << 26); // xzl: around 1 sec
+unsigned int interval = (1 << 26) / 10; // xzl: around 1 sec
 #else
 unsigned int interval = 1 * 1000 * 1000; // xzl: around 1 sec
 #endif
+
+extern int start_time;
 
 /* 	These are for Arm generic timer. 
 	They are fully functional on both QEMU and Rpi3 
@@ -51,4 +53,11 @@ void handle_timer_irq( void )
 	put32(TIMER_C1, curVal);
 	put32(TIMER_CS, TIMER_CS_M1);
 	timer_tick();
+}
+
+int elapsed_time()
+{
+	int elapsed = get_sys_time() - start_time;
+	elapsed = elapsed / interval;
+	return(elapsed);
 }

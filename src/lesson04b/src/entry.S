@@ -1,5 +1,10 @@
 #include "entry.h"
 
+.extern prev_sp
+.extern prev_pc
+.extern next_sp
+.extern next_pc
+
 	.macro handle_invalid_entry type
 	kernel_entry
 	mov	x0, #\type
@@ -31,9 +36,16 @@
 	stp	x24, x25, [sp, #16 * 12]
 	stp	x26, x27, [sp, #16 * 13]
 	stp	x28, x29, [sp, #16 * 14]
+	mov x0, sp
+	add x0, x0, #S_FRAME_SIZE
+	ldr x1, =prev_sp
+	str x0, [x1]
 
 	mrs	x22, elr_el1
 	mrs	x23, spsr_el1
+
+	ldr x1, =prev_pc
+	str x30, [x1]
 
 	stp	x30, x22, [sp, #16 * 15] 
 	str	x23, [sp, #16 * 16]
@@ -43,8 +55,17 @@
 	ldr	x23, [sp, #16 * 16]
 	ldp	x30, x22, [sp, #16 * 15] 
 
+	ldr x0, =next_pc
+	str x30, [x0]
+
 	msr	elr_el1, x22			
 	msr	spsr_el1, x23
+
+
+	ldr x0, =next_sp
+	mov x1, sp
+	add x1, x1, #S_FRAME_SIZE
+	str x1, [x0]
 
 	ldp	x0, x1, [sp, #16 * 0]
 	ldp	x2, x3, [sp, #16 * 1]

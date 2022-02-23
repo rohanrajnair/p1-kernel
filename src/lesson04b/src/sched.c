@@ -1,11 +1,19 @@
 #include "sched.h"
 #include "irq.h"
 #include "printf.h"
+#include "timer.h"
 
 static struct task_struct init_task = INIT_TASK;
 struct task_struct *current = &(init_task);
 struct task_struct * task[NR_TASKS] = {&(init_task), };
+struct switch_struct context_switches[50];
 int nr_tasks = 1;
+int num_switches = 0;
+// global vars to keep track of sp/pc
+unsigned long prev_sp = 0;
+unsigned long prev_pc = 0;
+unsigned long next_sp = 0;
+unsigned long next_pc = 0;
 
 void preempt_disable(void)
 {
@@ -70,11 +78,29 @@ void schedule(void)
 
 void switch_to(struct task_struct * next) 
 {
-	if (current == next) 
+	// printing info every 50 switches
+	if (num_switches == 50) {
+		for (int j = 0; j < 50; j++) {
+			struct switch_struct s = context_switches[j];
+			printf("%d from task%d (PC: %x SP: %x) to task%d (PC: %x SP: %x)\n", s.timestamp, s.prev_pid, s.prev_pc, s.prev_sp, s.next_pid, s.next_pc, s.next_sp);
+		}
+		num_switches = 0;
+	}
+	int timestamp = elapsed_time();
+	int prev_pid = current->pid;
+	int next_pid = next->pid;
+	if (current == next) {
+		struct switch_struct a = {timestamp, prev_pid, next_pid, prev_pc, next_pc, prev_sp, next_sp};
+		context_switches[num_switches++] = a; 
 		return;
-	struct task_struct * prev = current;
-	current = next;
-	cpu_switch_to(prev, next);
+	}
+	else {
+		struct task_struct * prev = current;
+		current = next;
+		cpu_switch_to(prev, next);
+		struct switch_struct b = {timestamp, prev_pid, next_pid, prev_pc, next_pc, prev_sp, next_sp};
+		context_switches[num_switches++] = b;
+	}
 }
 
 void schedule_tail(void) {

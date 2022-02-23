@@ -18,3 +18,8 @@ gen_timer_reset:
 #	lsl x0, x0, #24 
 	msr CNTP_TVAL_EL0, x0
     ret
+
+.globl get_sys_time
+get_sys_time:
+	mrs x0, CNTPCT_EL0
+	ret

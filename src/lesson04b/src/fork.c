@@ -20,6 +20,7 @@ int copy_process(unsigned long fn, unsigned long arg)
 	p->cpu_context.pc = (unsigned long)ret_from_fork;
 	p->cpu_context.sp = (unsigned long)p + THREAD_SIZE;
 	int pid = nr_tasks++;
+	p->pid = pid;
 	task[pid] = p;	
 	preempt_enable();
 	return 0;

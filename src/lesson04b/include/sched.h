@@ -40,6 +40,17 @@ struct task_struct {
 	long counter; /* countdown for scheduling. higher value means having run less */
 	long priority;
 	long preempt_count;
+	int pid;
+};
+
+struct switch_struct {
+	int timestamp;
+	int prev_pid;
+	int next_pid;
+	unsigned long prev_pc;
+	unsigned long next_pc;
+	unsigned long prev_sp;
+	unsigned long next_sp;
 };
 
 extern void sched_init(void);
