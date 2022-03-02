@@ -1,0 +1,709 @@
+diff --git a/src/lesson04b/include/sched.h b/src/lesson04b/include/sched.h
+index 4d409a7..db9fd48 100644
+--- a/src/lesson04b/include/sched.h
++++ b/src/lesson04b/include/sched.h
+@@ -40,6 +40,17 @@ struct task_struct {
+ 	long counter; /* countdown for scheduling. higher value means having run less */
+ 	long priority;
+ 	long preempt_count;
++	int pid;
++};
++
++struct switch_struct {
++	int timestamp;
++	int prev_pid;
++	int next_pid;
++	unsigned long prev_pc;
++	unsigned long next_pc;
++	unsigned long prev_sp;
++	unsigned long next_sp;
+ };
+ 
+ extern void sched_init(void);
+diff --git a/src/lesson04b/include/timer.h b/src/lesson04b/include/timer.h
+index 0e32fad..fd84769 100644
+--- a/src/lesson04b/include/timer.h
++++ b/src/lesson04b/include/timer.h
+@@ -9,5 +9,7 @@ void handle_generic_timer_irq ( void );
+ 
+ extern void gen_timer_init();
+ extern void gen_timer_reset();
++extern int get_sys_time();
++int elapsed_time();
+ 
+ #endif  /*_TIMER_H */
+diff --git a/src/lesson04b/src/entry.S b/src/lesson04b/src/entry.S
+index c85164f..020d7b3 100644
+--- a/src/lesson04b/src/entry.S
++++ b/src/lesson04b/src/entry.S
+@@ -1,5 +1,10 @@
+ #include "entry.h"
+ 
++.extern prev_sp
++.extern prev_pc
++.extern next_sp
++.extern next_pc
++
+ 	.macro handle_invalid_entry type
+ 	kernel_entry
+ 	mov	x0, #\type
+@@ -31,10 +36,17 @@
+ 	stp	x24, x25, [sp, #16 * 12]
+ 	stp	x26, x27, [sp, #16 * 13]
+ 	stp	x28, x29, [sp, #16 * 14]
++	mov x0, sp
++	add x0, x0, #S_FRAME_SIZE
++	ldr x1, =prev_sp
++	str x0, [x1]
+ 
+ 	mrs	x22, elr_el1
+ 	mrs	x23, spsr_el1
+ 
++	ldr x1, =prev_pc
++	str x30, [x1]
++
+ 	stp	x30, x22, [sp, #16 * 15] 
+ 	str	x23, [sp, #16 * 16]
+ 	.endm
+@@ -43,9 +55,18 @@
+ 	ldr	x23, [sp, #16 * 16]
+ 	ldp	x30, x22, [sp, #16 * 15] 
+ 
++	ldr x0, =next_pc
++	str x30, [x0]
++
+ 	msr	elr_el1, x22			
+ 	msr	spsr_el1, x23
+ 
++
++	ldr x0, =next_sp
++	mov x1, sp
++	add x1, x1, #S_FRAME_SIZE
++	str x1, [x0]
++
+ 	ldp	x0, x1, [sp, #16 * 0]
+ 	ldp	x2, x3, [sp, #16 * 1]
+ 	ldp	x4, x5, [sp, #16 * 2]
+diff --git a/src/lesson04b/src/fork.c b/src/lesson04b/src/fork.c
+index 472b389..e3f9d7e 100644
+--- a/src/lesson04b/src/fork.c
++++ b/src/lesson04b/src/fork.c
+@@ -20,6 +20,7 @@ int copy_process(unsigned long fn, unsigned long arg)
+ 	p->cpu_context.pc = (unsigned long)ret_from_fork;
+ 	p->cpu_context.sp = (unsigned long)p + THREAD_SIZE;
+ 	int pid = nr_tasks++;
++	p->pid = pid;
+ 	task[pid] = p;	
+ 	preempt_enable();
+ 	return 0;
+diff --git a/src/lesson04b/src/kernel.c b/src/lesson04b/src/kernel.c
+index ae50ca0..acd72dc 100644
+--- a/src/lesson04b/src/kernel.c
++++ b/src/lesson04b/src/kernel.c
+@@ -6,6 +6,13 @@
+ #include "sched.h"
+ #include "mini_uart.h"
+ 
++int start_time;
++
++int getpid()
++{
++	return(current->pid);
++}
++
+ void process(char *array)
+ {
+ 	while (1) {
+@@ -28,6 +35,7 @@ void process2(char *array)
+ 
+ void kernel_main(void)
+ {
++	start_time = get_sys_time();
+ 	uart_init();
+ 	init_printf(0, putc);
+ 
+@@ -49,6 +57,17 @@ void kernel_main(void)
+ 		return;
+ 	}
+ 
++	res = copy_process((unsigned long)&process, (unsigned long)"6789");
++	if (res != 0) {
++		printf("error while starting process 1");
++		return;
++	}
++	res = copy_process((unsigned long)&process2, (unsigned long)"wxyz");
++	if (res != 0) {
++		printf("error while starting process 2");
++		return;
++	}
++
+ 	while (1){
+ 		schedule();
+ 	}	
+diff --git a/src/lesson04b/src/sched.c b/src/lesson04b/src/sched.c
+index fe27b68..0267c70 100644
+--- a/src/lesson04b/src/sched.c
++++ b/src/lesson04b/src/sched.c
+@@ -1,11 +1,19 @@
+ #include "sched.h"
+ #include "irq.h"
+ #include "printf.h"
++#include "timer.h"
+ 
+ static struct task_struct init_task = INIT_TASK;
+ struct task_struct *current = &(init_task);
+ struct task_struct * task[NR_TASKS] = {&(init_task), };
++struct switch_struct context_switches[50];
+ int nr_tasks = 1;
++int num_switches = 0;
++// global vars to keep track of sp/pc
++unsigned long prev_sp = 0;
++unsigned long prev_pc = 0;
++unsigned long next_sp = 0;
++unsigned long next_pc = 0;
+ 
+ void preempt_disable(void)
+ {
+@@ -70,11 +78,29 @@ void schedule(void)
+ 
+ void switch_to(struct task_struct * next) 
+ {
+-	if (current == next) 
++	// printing info every 50 switches
++	if (num_switches == 50) {
++		for (int j = 0; j < 50; j++) {
++			struct switch_struct s = context_switches[j];
++			printf("%d from task%d (PC: %x SP: %x) to task%d (PC: %x SP: %x)\n", s.timestamp, s.prev_pid, s.prev_pc, s.prev_sp, s.next_pid, s.next_pc, s.next_sp);
++		}
++		num_switches = 0;
++	}
++	int timestamp = elapsed_time();
++	int prev_pid = current->pid;
++	int next_pid = next->pid;
++	if (current == next) {
++		struct switch_struct a = {timestamp, prev_pid, next_pid, prev_pc, next_pc, prev_sp, next_sp};
++		context_switches[num_switches++] = a; 
+ 		return;
+-	struct task_struct * prev = current;
+-	current = next;
+-	cpu_switch_to(prev, next);
++	}
++	else {
++		struct task_struct * prev = current;
++		current = next;
++		cpu_switch_to(prev, next);
++		struct switch_struct b = {timestamp, prev_pid, next_pid, prev_pc, next_pc, prev_sp, next_sp};
++		context_switches[num_switches++] = b;
++	}
+ }
+ 
+ void schedule_tail(void) {
+diff --git a/src/lesson04b/src/timer.S b/src/lesson04b/src/timer.S
+index 80b861f..852ed9d 100644
+--- a/src/lesson04b/src/timer.S
++++ b/src/lesson04b/src/timer.S
+@@ -17,4 +17,9 @@ gen_timer_reset:
+ #    mov x0, #1
+ #	lsl x0, x0, #24 
+ 	msr CNTP_TVAL_EL0, x0
+-    ret
+\ No newline at end of file
++    ret
++
++.globl get_sys_time
++get_sys_time:
++	mrs x0, CNTPCT_EL0
++	ret
+\ No newline at end of file
+diff --git a/src/lesson04b/src/timer.c b/src/lesson04b/src/timer.c
+index 1f15382..f586a37 100644
+--- a/src/lesson04b/src/timer.c
++++ b/src/lesson04b/src/timer.c
+@@ -5,11 +5,13 @@
+ #include "timer.h"
+ 
+ #ifdef USE_QEMU
+-unsigned int interval = (1 << 26); // xzl: around 1 sec
++unsigned int interval = (1 << 26) / 10; // xzl: around 1 sec
+ #else
+ unsigned int interval = 1 * 1000 * 1000; // xzl: around 1 sec
+ #endif
+ 
++extern int start_time;
++
+ /* 	These are for Arm generic timer. 
+ 	They are fully functional on both QEMU and Rpi3 
+ 	Recommended.
+@@ -51,4 +53,11 @@ void handle_timer_irq( void )
+ 	put32(TIMER_C1, curVal);
+ 	put32(TIMER_CS, TIMER_CS_M1);
+ 	timer_tick();
++}
++
++int elapsed_time()
++{
++	int elapsed = get_sys_time() - start_time;
++	elapsed = elapsed / interval;
++	return(elapsed);
+ }
+\ No newline at end of file
+diff --git a/src/lesson04b/test.log b/src/lesson04b/test.log
+new file mode 100644
+index 0000000..4a890dd
+--- /dev/null
++++ b/src/lesson04b/test.log
+@@ -0,0 +1,454 @@
++Exception return from AArch64 EL2 to AArch64 EL1 PC 0x80038
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068
++Taking exception 5 [IRQ]
++...from EL1 to EL1
++...with ESR 0x0/0x0
++...with ELR 0x83068
++...to EL1 PC 0x82280 PSTATE 0x3c5
++Exception return from AArch64 EL1 to AArch64 EL1 PC 0x83068

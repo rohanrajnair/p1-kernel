@@ -14,8 +14,18 @@
 #define DELAYS 500000
 #endif
 
+int current_el = -1;
+
+static unsigned int read_current_el(void)
+{
+	unsigned int val;
+	asm volatile ("mrs %0, CurrentEL" : "=r" (val));
+  	return val;
+}
+
 void user_process1(char *array)
 {
+	current_el = read_current_el();
 	char buf[2] = {0};
 	while (1){
 		for (int i = 0; i < 5; i++){
@@ -54,11 +64,12 @@ void user_process(){
 }
 
 void kernel_process(){
+	//call_sys_exit();
 	printf("Kernel process started. EL %d\r\n", get_el());
 	int err = move_to_user_mode((unsigned long)&user_process);
 	if (err < 0) {
 		printf("Error while moving process to user mode\n\r");
-	} 
+	}
 }
 
 
